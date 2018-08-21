@@ -31,26 +31,15 @@ import org.apache.activemq.artemis.api.core.ActiveMQException
 import org.apache.activemq.artemis.api.core.ActiveMQNotConnectedException
 import org.apache.activemq.artemis.api.core.RoutingType
 import org.apache.activemq.artemis.api.core.SimpleString
+import org.apache.activemq.artemis.api.core.client.*
 import org.apache.activemq.artemis.api.core.client.ActiveMQClient.DEFAULT_ACK_BATCH_SIZE
-import org.apache.activemq.artemis.api.core.client.ClientConsumer
-import org.apache.activemq.artemis.api.core.client.ClientMessage
-import org.apache.activemq.artemis.api.core.client.ClientProducer
-import org.apache.activemq.artemis.api.core.client.ClientSession
-import org.apache.activemq.artemis.api.core.client.ClientSessionFactory
-import org.apache.activemq.artemis.api.core.client.FailoverEventType
-import org.apache.activemq.artemis.api.core.client.ServerLocator
 import rx.Notification
 import rx.Observable
 import rx.subjects.UnicastSubject
 import java.lang.reflect.InvocationHandler
 import java.lang.reflect.Method
 import java.util.*
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.*
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.reflect.jvm.javaMethod
@@ -288,7 +277,22 @@ class RPCClientProxyHandler(
 
     // The handler for Artemis messages.
     private fun artemisMessageHandler(message: ClientMessage) {
-        val serverToClient = RPCApi.ServerToClient.fromClientMessage(serializationContextWithObservableContext, message)
+        fun completeExceptionally(id: InvocationId, e: Throwable, future: SettableFuture<Any?>?) {
+            val rpcCallSite: Throwable? = callSiteMap?.get(id)
+            if (rpcCallSite != null) addRpcCallSiteToThrowable(e, rpcCallSite)
+            future?.setException(e.cause!!)
+        }
+
+        // Deserialize the reply from the server, both the wrapping metadata and the actual body of the return value.
+        val serverToClient: RPCApi.ServerToClient = try {
+            RPCApi.ServerToClient.fromClientMessage(serializationContextWithObservableContext, message)
+        } catch (e: RPCApi.ServerToClient.FailedToDeserializeReply) {
+            // Might happen if something goes wrong during mapping the response to classes, evolution, class synthesis etc.
+            log.error("Failed to deserialize RPC body", e)
+            completeExceptionally(e.id, e, rpcReplyMap.remove(e.id))
+            message.acknowledge()
+            return
+        }
         val deduplicationSequenceNumber = message.getLongProperty(RPCApi.DEDUPLICATION_SEQUENCE_NUMBER_FIELD_NAME)
         if (deduplicationChecker.checkDuplicateMessageId(serverToClient.deduplicationIdentity, deduplicationSequenceNumber)) {
             log.info("Message duplication detected, discarding message")
@@ -301,13 +305,11 @@ class RPCClientProxyHandler(
                 if (replyFuture == null) {
                     log.error("RPC reply arrived to unknown RPC ID ${serverToClient.id}, this indicates an internal RPC error.")
                 } else {
-                    val result = serverToClient.result
+                    val result: Try<Any?> = serverToClient.result
                     when (result) {
                         is Try.Success -> replyFuture.set(result.value)
                         is Try.Failure -> {
-                            val rpcCallSite = callSiteMap?.get(serverToClient.id)
-                            if (rpcCallSite != null) addRpcCallSiteToThrowable(result.exception, rpcCallSite)
-                            replyFuture.setException(result.exception)
+                            completeExceptionally(serverToClient.id, result.exception, replyFuture)
                         }
                     }
                 }
